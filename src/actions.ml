@@ -830,11 +830,11 @@ let minimize_failed_tests ~bot_info ~owner ~repo ~pr_number ~base ~head
             (suggested_and_possible_jobs_to_minimize, false)
         | RequestExplicit requests, _ ->
             ( suggested_and_possible_jobs_to_minimize
-              |> List.filter ~f:(fun {target; full_target} ->
+              |> List.filter ~f:(fun {target (*; full_target*)} ->
                      List.exists
                        ~f:(fun request ->
                          String.equal target request
-                         || String.equal full_target request)
+                         (*|| String.equal full_target request*))
                        requests)
             , false )
       in
@@ -847,7 +847,229 @@ let minimize_failed_tests ~bot_info ~owner ~repo ~pr_number ~base ~head
         ~ci_minimization_infos:jobs_to_minimize
       >>= fun (jobs_minimized, jobs_that_could_not_be_minimized) ->
       (* Construct a comment body *)
+      let unminimizable_jobs_description ~f =
+        match
+          unminimizable_jobs |> List.filter ~f:(fun (name, _) -> f name)
+        with
+        | [] ->
+            None
+        | [(name, err)] ->
+            Some
+              (Printf.sprintf "The job %s could not be minimized because %s.\n"
+                 name err)
+        | unminimizable_jobs ->
+            Some
+              ( "The following jobs could not be minimized:\n"
+              ^ ( unminimizable_jobs
+                |> List.map ~f:(fun (name, err) ->
+                       Printf.sprintf "- %s (%s)" name err)
+                |> String.concat ~sep:"\n" )
+              ^ "\n" )
+      in
+      let bad_jobs_description ~f =
+        match
+          bad_jobs_to_minimize
+          |> List.filter ~f:(fun (_, {target (*; full_target*)}) ->
+                 f target (*|| f full_target*))
+        with
+        | [] ->
+            None
+        | [(reason, {target})] ->
+            Some
+              (Printf.sprintf "The job %s was not minimized because %s.\n"
+                 target reason)
+        | bad_jobs ->
+            Some
+              ( "The following jobs were not minimized:\n"
+              ^ ( bad_jobs
+                |> List.map ~f:(fun (reason, {target}) ->
+                       Printf.sprintf "- %s because %s" target reason)
+                |> String.concat ~sep:"\n" )
+              ^ "\n" )
+      in
+      let bad_and_unminimizable_jobs_description ~f =
+        match (bad_jobs_description ~f, unminimizable_jobs_description ~f) with
+        | None, None ->
+            None
+        | Some msg, None | None, Some msg ->
+            Some msg
+        | Some msg1, Some msg2 ->
+            Some (msg1 ^ msg2)
+      in
+      let failed_minimization_description =
+        match jobs_that_could_not_be_minimized with
+        | [] ->
+            None
+        | _ :: _ ->
+            Some
+              ( "I failed to trigger minimization on the following jobs:\n"
+              ^ ( jobs_that_could_not_be_minimized
+                |> List.map ~f:(fun (name, err) ->
+                       Printf.sprintf "- %s (%s)" name err)
+                |> String.concat ~sep:"\n" )
+              ^ "\n" )
+      in
       match (request, jobs_minimized, jobs_that_could_not_be_minimized) with
+      | RequestAll, [], [] ->
+          Lwt.return_some
+            ( match
+                bad_and_unminimizable_jobs_description ~f:(fun _ -> true)
+              with
+            | None ->
+                f "No valid CI jobs detected for %s" head
+            | Some msg ->
+                f
+                  "I attempted to run all CI jobs at commit %s for \
+                   minimization, but was unable to find any jobs to minimize.\n\n\
+                   %s"
+                  head msg )
+      | RequestAll, _, _ ->
+          ( match bad_and_unminimizable_jobs_description ~f:(fun _ -> true) with
+          | Some msg ->
+              Lwt_io.printlf
+                "When attempting to run CI Minimization by request all on \
+                 %s/%s@%s for PR #%d:\n\
+                 %s"
+                owner repo head pr_number msg
+          | None ->
+              Lwt.return_unit )
+          >>= fun () ->
+          ( match jobs_minimized with
+          | [] ->
+              f
+                "I did not succeed at triggering minimization on any jobs at \
+                 commit %s."
+                head
+          | _ :: _ ->
+              f
+                "I am now running minimization at commit %s on %s. I'll come \
+                 back to you with the results once it's done."
+                head
+                (String.concat ~sep:", " jobs_minimized) )
+          ^ "\n\n"
+          ^ Option.value ~default:"" failed_minimization_description
+          |> Lwt.return_some
+      | RequestExplicit requests, _, _ ->
+          requests
+          |> List.partition3_map ~f:(fun request ->
+                 match
+                   ( List.exists ~f:(String.equal request) jobs_minimized
+                   , List.find
+                       ~f:(fun (target, _) -> String.equal request target)
+                       jobs_that_could_not_be_minimized
+                   , List.find
+                       ~f:(fun (target, _) -> String.equal request target)
+                       unminimizable_jobs
+                   , List.find
+                       ~f:(fun (_, {target}) -> String.equal request target)
+                       bad_jobs_to_minimize )
+                 with
+                 | true, _, _, _ ->
+                     `Fst request
+                 | false, Some (target, err), _, _ ->
+                     `Snd
+                       (f "%s: failed to trigger minimization (%s)" target err)
+                 | false, None, Some (target, err), _ ->
+                     `Snd (f "%s could not be minimized (%s)" target err)
+                 | false, None, None, Some (reason, {target}) ->
+                     `Snd (f "%s was not minimized because %s" target reason)
+                 | false, None, None, None ->
+                     `Trd request)
+          |> fun (successful_requests, unsuccessful_requests, unfound_requests) ->
+          let unsuccessful_requests_report =
+            match unsuccessful_requests with
+            | [] ->
+                None
+            | [msg] ->
+                Some msg
+            | _ ->
+                Some
+                  ( "The following requests were not fulfilled:\n"
+                  ^ String.concat ~sep:"\n"
+                      (List.map
+                         ~f:(fun msg -> "- " ^ msg)
+                         unsuccessful_requests) )
+          in
+          let unfound_requests_report =
+            match unfound_requests with
+            | [] ->
+                None
+            | [request] ->
+                Some (f "requested target %s could not be found" request)
+            | _ :: _ :: _ ->
+                Some
+                  (f "requested targets %s could not be found"
+                     (String.concat ~sep:", " unfound_requests))
+          in
+          let unsuccessful_requests_report =
+            match (unsuccessful_requests_report, unfound_requests_report) with
+            | None, None ->
+                None
+            | Some msg, None ->
+                Some msg
+            | None, Some msg ->
+                Some ("The " ^ msg)
+            | Some msg1, Some msg2 ->
+                Some (msg1 ^ "\nAdditionally, the " ^ msg2)
+          in
+          ( match (successful_requests, unsuccessful_requests_report) with
+          | [], None ->
+              "No CI minimization requests made?"
+          | [], Some msg ->
+              "I was unable to minimize any of the CI targets that you \
+               requested.\n" ^ msg
+          | _ :: _, _ ->
+              f
+                "I am now running minimization at commit %s on requested %s \
+                 %s. I'll come back to you with the results once it's done.\n\n\
+                 %s"
+                head
+                ( match successful_requests with
+                | [_] ->
+                    "target"
+                | _ ->
+                    "targets" )
+                (String.concat ~sep:", " successful_requests)
+                (Option.value ~default:"" unsuccessful_requests_report) )
+          |> Lwt.return_some
+      | RequestSuggested, [], [] ->
+          ( match possible_jobs_to_minimize with
+          | [] ->
+              f "No CI jobs are available to be minimized for commit %s." head
+          | _ :: _ ->
+              f
+                "You requested minimization of suggested failing CI jobs, but \
+                 no jobs were suggested at commit %s. You can trigger \
+                 minimization of %s with `ci miniminize all` or by requesting \
+                 some targets by name."
+                head
+                (String.concat ~sep:", "
+                   (List.map
+                      ~f:(fun (_, {target}) -> target)
+                      possible_jobs_to_minimize)) )
+          |> Lwt.return_some
+      | RequestSuggested, [], _ :: _ ->
+          f
+            "I attempted to minimize suggested failing CI jobs at commit %s, \
+             but was unable to succeed on any jobs.\n\
+             %s"
+            head
+            (Option.value ~default:"(internal error)"
+               failed_minimization_description)
+          |> Lwt.return_some
+          (*
+        ( match
+                bad_and_unminimizable_jobs_description ~f:(fun name -> List.exists (String.equal name) requests)
+              with
+            | None ->
+                f "No valid CI jobs detected for %s" head
+            | Some msg ->
+                f
+                  "I attempted to run all CI jobs at commit %s for \
+                   minimization, but was unable to find any jobs to minimize.\n\n\
+                   %s"
+                  head msg )
+*)
       | Auto, [], [] when suggest_minimization ->
           Lwt.return_unit
       | _, _, _ ->
