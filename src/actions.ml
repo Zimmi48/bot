@@ -473,8 +473,7 @@ type ci_minimization_info =
 
 let run_ci_minimization ~bot_info ~comment_thread_id ~owner ~repo ~base ~head
     ~ci_minimization_infos =
-  (* XXX Will parallel map cause interference with git locks? *)
-  Lwt_list.map_p
+  Lwt_list.map_s
     (fun {target; opam_switch; failing_urls; passing_urls; docker_image} ->
       git_run_ci_minimization ~bot_info ~comment_thread_id ~owner ~repo
         ~docker_image ~target ~opam_switch ~failing_urls ~passing_urls ~base
