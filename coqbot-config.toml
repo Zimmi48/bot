@@ -16,7 +16,7 @@ app_id="31373"
   [gitlab.inria]
   domain="gitlab.inria.fr"
   api_token_env_var="INRIA_GITLAB_ACCESS_TOKEN"
-  bot_name="x-CBot"
+  bot_name="thzimmer"
 
 [mappings]
   [mappings.rocq]
